@@ -8,18 +8,21 @@ app.use(cors());
 const PORT = process.env.PORT || 3000;
 const WS_URL = "wss://trackensure.gitstel.net/sw-monitor/?EIO=3&transport=websocket";
 
-// Статистика за день (накопительная)
+// --- ДАННЫЕ ---
 let dailyStats = {
     _date: new Date().toLocaleDateString("en-US"),
     queues: {}
 };
 
-// Журнал событий (для расчета периодов 1h/2h/4h)
-// { time: 123456789, type: 'ans'|'abd', sl: true|false, queue: 'Q700' }
+// Журнал для графиков
 let eventLog = [];
 
-// Временная память (кто висит на линии)
+// Временная память для SL (номер -> время входа)
 const callJoinTimes = new Map();
+
+// ГЛАВНОЕ НОВОВВЕДЕНИЕ: Список активных звонков
+// Структура: { "Q700": [ { number: "...", name: "...", time: 12345 } ], ... }
+let activeCallers = {};
 
 function checkDateAndReset() {
     const today = new Date().toLocaleDateString("en-US");
@@ -28,6 +31,7 @@ function checkDateAndReset() {
         dailyStats = { _date: today, queues: {} };
         eventLog = [];
         callJoinTimes.clear();
+        // activeCallers НЕ сбрасываем, так как люди могут висеть через полночь
     }
 }
 
@@ -36,6 +40,13 @@ function getQStats(qid) {
         dailyStats.queues[qid] = { ans: 0, abd: 0, sl_hits: 0 };
     }
     return dailyStats.queues[qid];
+}
+
+// Хелпер: Удалить активного звонящего из списка
+function removeActiveCaller(qid, number) {
+    if (activeCallers[qid]) {
+        activeCallers[qid] = activeCallers[qid].filter(c => c.number !== number);
+    }
 }
 
 // --- WS ---
@@ -67,8 +78,19 @@ function connect() {
 
             // 1. JOIN
             if (type === 'queue_caller_join') {
-                const num = d.connectedlinenum || d.calleridnum || d.caller_number;
-                if (num) callJoinTimes.set(num, Date.now());
+                const num = d.connectedlinenum || d.calleridnum || d.caller_number || "";
+                const name = d.connectedlinename || d.calleridname || d.caller_name || "";
+                const qid = d.queue;
+
+                if (num) {
+                    callJoinTimes.set(num, Date.now());
+                    
+                    // Добавляем в активный список
+                    if (!activeCallers[qid]) activeCallers[qid] = [];
+                    // Сначала удаляем дубликат, если вдруг есть
+                    removeActiveCaller(qid, num);
+                    activeCallers[qid].push({ number: num, name: name, joinTime: Date.now() });
+                }
             }
 
             // 2. LEAVE (Answered)
@@ -77,6 +99,9 @@ function connect() {
                 const num = d.caller_number || d.calleridnum;
                 
                 if (qid) {
+                    // Убираем из активных
+                    if (num) removeActiveCaller(qid, num);
+
                     const stats = getQStats(qid);
                     stats.ans++;
                     
@@ -89,7 +114,6 @@ function connect() {
                         }
                         callJoinTimes.delete(num);
                     }
-
                     eventLog.push({ time: Date.now(), type: 'ans', sl: isSlHit, queue: qid });
                 }
             }
@@ -97,7 +121,17 @@ function connect() {
             // 3. ABANDON
             if (type === 'queue_caller_abandon') {
                 const qid = d.queue;
+                const num = d.caller_number || d.calleridnum; // Обычно здесь есть номер
+
                 if (qid) {
+                    // Убираем из активных (ищем по номеру, если он пришел, или удаляем самого старого, если нет)
+                    if (num) {
+                        removeActiveCaller(qid, num);
+                    } else if (activeCallers[qid] && activeCallers[qid].length > 0) {
+                        // Если номера нет, удаляем первого (FIFO) - грубый метод, но лучше чем ничего
+                        activeCallers[qid].shift();
+                    }
+
                     const stats = getQStats(qid);
                     stats.abd++;
                     eventLog.push({ time: Date.now(), type: 'abd', sl: false, queue: qid });
@@ -118,58 +152,38 @@ app.get('/stats', (req, res) => {
     const now = Date.now();
     const periods = { h1: 3600000, h2: 7200000, h4: 14400000 };
     
-    // Структура ответа
     const response = {
         daily: dailyStats,
         globalPeriods: { h1: {}, h2: {}, h4: {} },
-        queuesPeriods: {} // { Q700: { h1: {ans, abd, sl}, ... } }
+        queuesPeriods: {},
+        activeCallers: activeCallers // <--- ОТДАЕМ СПИСОК ЗВОНЯЩИХ
     };
 
-    // Хелпер для создания пустой статистики
     const createStat = () => ({ ans: 0, abd: 0, slHits: 0, sl: 0 });
 
-    // Инициализируем объекты для всех очередей, которые есть в dailyStats
     Object.keys(dailyStats.queues).forEach(qid => {
-        response.queuesPeriods[qid] = {
-            h1: createStat(), h2: createStat(), h4: createStat()
-        };
+        response.queuesPeriods[qid] = { h1: createStat(), h2: createStat(), h4: createStat() };
     });
-    // Инициализируем глобальные
     response.globalPeriods = { h1: createStat(), h2: createStat(), h4: createStat() };
 
-    // Проходим по логу ОДИН раз (эффективность)
     eventLog.forEach(ev => {
         const diff = now - ev.time;
-        
         ['h1', 'h2', 'h4'].forEach(pKey => {
             if (diff <= periods[pKey]) {
-                // 1. Обновляем Глобальную стату
                 const gStat = response.globalPeriods[pKey];
-                if (ev.type === 'ans') {
-                    gStat.ans++;
-                    if (ev.sl) gStat.slHits++;
-                } else {
-                    gStat.abd++;
-                }
+                if (ev.type === 'ans') { gStat.ans++; if (ev.sl) gStat.slHits++; } else { gStat.abd++; }
 
-                // 2. Обновляем Стату Очереди (если такая очередь есть в структуре)
                 if (response.queuesPeriods[ev.queue]) {
                     const qStat = response.queuesPeriods[ev.queue][pKey];
-                    if (ev.type === 'ans') {
-                        qStat.ans++;
-                        if (ev.sl) qStat.slHits++;
-                    } else {
-                        qStat.abd++;
-                    }
+                    if (ev.type === 'ans') { qStat.ans++; if (ev.sl) qStat.slHits++; } else { qStat.abd++; }
                 }
             }
         });
     });
 
-    // Финальный расчет процентов SL
     const calcSL = (obj) => {
         obj.sl = obj.ans > 0 ? Math.round((obj.slHits / obj.ans) * 100) : 0;
-        delete obj.slHits; // чистим мусор
+        delete obj.slHits;
     };
 
     ['h1', 'h2', 'h4'].forEach(p => {
