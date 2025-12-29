@@ -8,17 +8,17 @@ app.use(cors());
 const PORT = process.env.PORT || 3000;
 const WS_URL = "wss://trackensure.gitstel.net/sw-monitor/?EIO=3&transport=websocket";
 
-// --- ХРАНИЛИЩЕ ДАННЫХ ---
+// Статистика за день (накопительная)
 let dailyStats = {
     _date: new Date().toLocaleDateString("en-US"),
     queues: {}
 };
 
-// Журнал событий для расчета периодов (1h, 2h, 4h)
-// Храним объекты: { time: 1678888..., type: 'ans'|'abd', sl: true|false }
+// Журнал событий (для расчета периодов 1h/2h/4h)
+// { time: 123456789, type: 'ans'|'abd', sl: true|false, queue: 'Q700' }
 let eventLog = [];
 
-// Временная память (кто сейчас висит на линии)
+// Временная память (кто висит на линии)
 const callJoinTimes = new Map();
 
 function checkDateAndReset() {
@@ -26,7 +26,7 @@ function checkDateAndReset() {
     if (dailyStats._date !== today) {
         console.log("New day! Stats reset.");
         dailyStats = { _date: today, queues: {} };
-        eventLog = []; // Очищаем журнал за прошлый день
+        eventLog = [];
         callJoinTimes.clear();
     }
 }
@@ -38,7 +38,7 @@ function getQStats(qid) {
     return dailyStats.queues[qid];
 }
 
-// --- WS LOGIC ---
+// --- WS ---
 let ws;
 let pingInterval;
 
@@ -90,12 +90,7 @@ function connect() {
                         callJoinTimes.delete(num);
                     }
 
-                    // Добавляем в журнал для графиков/ховера
-                    eventLog.push({
-                        time: Date.now(),
-                        type: 'ans',
-                        sl: isSlHit
-                    });
+                    eventLog.push({ time: Date.now(), type: 'ans', sl: isSlHit, queue: qid });
                 }
             }
 
@@ -105,13 +100,7 @@ function connect() {
                 if (qid) {
                     const stats = getQStats(qid);
                     stats.abd++;
-                    
-                    // Добавляем в журнал
-                    eventLog.push({
-                        time: Date.now(),
-                        type: 'abd',
-                        sl: false
-                    });
+                    eventLog.push({ time: Date.now(), type: 'abd', sl: false, queue: qid });
                 }
             }
 
@@ -127,31 +116,68 @@ connect();
 // --- API ---
 app.get('/stats', (req, res) => {
     const now = Date.now();
+    const periods = { h1: 3600000, h2: 7200000, h4: 14400000 };
     
-    // Функция подсчета за последние N миллисекунд
-    const calcPeriod = (ms) => {
-        const threshold = now - ms;
-        // Берем события только за этот период
-        const events = eventLog.filter(e => e.time >= threshold);
-        
-        const ans = events.filter(e => e.type === 'ans').length;
-        const abd = events.filter(e => e.type === 'abd').length;
-        const slHits = events.filter(e => e.type === 'ans' && e.sl).length;
-        
-        // SL считаем только от отвеченных в этот период
-        const sl = ans > 0 ? Math.round((slHits / ans) * 100) : 0;
-        
-        return { ans, abd, sl };
+    // Структура ответа
+    const response = {
+        daily: dailyStats,
+        globalPeriods: { h1: {}, h2: {}, h4: {} },
+        queuesPeriods: {} // { Q700: { h1: {ans, abd, sl}, ... } }
     };
 
-    res.json({
-        daily: dailyStats, // Общая за день (для таблицы)
-        periods: {         // Для тултипов
-            h1: calcPeriod(3600 * 1000),      // 1 час
-            h2: calcPeriod(7200 * 1000),      // 2 часа
-            h4: calcPeriod(14400 * 1000)      // 4 часа
-        }
+    // Хелпер для создания пустой статистики
+    const createStat = () => ({ ans: 0, abd: 0, slHits: 0, sl: 0 });
+
+    // Инициализируем объекты для всех очередей, которые есть в dailyStats
+    Object.keys(dailyStats.queues).forEach(qid => {
+        response.queuesPeriods[qid] = {
+            h1: createStat(), h2: createStat(), h4: createStat()
+        };
     });
+    // Инициализируем глобальные
+    response.globalPeriods = { h1: createStat(), h2: createStat(), h4: createStat() };
+
+    // Проходим по логу ОДИН раз (эффективность)
+    eventLog.forEach(ev => {
+        const diff = now - ev.time;
+        
+        ['h1', 'h2', 'h4'].forEach(pKey => {
+            if (diff <= periods[pKey]) {
+                // 1. Обновляем Глобальную стату
+                const gStat = response.globalPeriods[pKey];
+                if (ev.type === 'ans') {
+                    gStat.ans++;
+                    if (ev.sl) gStat.slHits++;
+                } else {
+                    gStat.abd++;
+                }
+
+                // 2. Обновляем Стату Очереди (если такая очередь есть в структуре)
+                if (response.queuesPeriods[ev.queue]) {
+                    const qStat = response.queuesPeriods[ev.queue][pKey];
+                    if (ev.type === 'ans') {
+                        qStat.ans++;
+                        if (ev.sl) qStat.slHits++;
+                    } else {
+                        qStat.abd++;
+                    }
+                }
+            }
+        });
+    });
+
+    // Финальный расчет процентов SL
+    const calcSL = (obj) => {
+        obj.sl = obj.ans > 0 ? Math.round((obj.slHits / obj.ans) * 100) : 0;
+        delete obj.slHits; // чистим мусор
+    };
+
+    ['h1', 'h2', 'h4'].forEach(p => {
+        calcSL(response.globalPeriods[p]);
+        Object.values(response.queuesPeriods).forEach(qObj => calcSL(qObj[p]));
+    });
+
+    res.json(response);
 });
 
 app.listen(PORT, () => console.log(`Server on ${PORT}`));
