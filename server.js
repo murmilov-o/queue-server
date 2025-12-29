@@ -8,21 +8,17 @@ app.use(cors());
 const PORT = process.env.PORT || 3000;
 const WS_URL = "wss://trackensure.gitstel.net/sw-monitor/?EIO=3&transport=websocket";
 
-// --- ДАННЫЕ ---
+// Статистика за день
 let dailyStats = {
     _date: new Date().toLocaleDateString("en-US"),
     queues: {}
 };
 
-// Журнал для графиков
+// Лог для расчета периодов (1h, 2h, 4h)
 let eventLog = [];
 
-// Временная память для SL (номер -> время входа)
+// Временная память для SL (номер -> время)
 const callJoinTimes = new Map();
-
-// ГЛАВНОЕ НОВОВВЕДЕНИЕ: Список активных звонков
-// Структура: { "Q700": [ { number: "...", name: "...", time: 12345 } ], ... }
-let activeCallers = {};
 
 function checkDateAndReset() {
     const today = new Date().toLocaleDateString("en-US");
@@ -31,7 +27,6 @@ function checkDateAndReset() {
         dailyStats = { _date: today, queues: {} };
         eventLog = [];
         callJoinTimes.clear();
-        // activeCallers НЕ сбрасываем, так как люди могут висеть через полночь
     }
 }
 
@@ -42,14 +37,6 @@ function getQStats(qid) {
     return dailyStats.queues[qid];
 }
 
-// Хелпер: Удалить активного звонящего из списка
-function removeActiveCaller(qid, number) {
-    if (activeCallers[qid]) {
-        activeCallers[qid] = activeCallers[qid].filter(c => c.number !== number);
-    }
-}
-
-// --- WS ---
 let ws;
 let pingInterval;
 
@@ -78,19 +65,8 @@ function connect() {
 
             // 1. JOIN
             if (type === 'queue_caller_join') {
-                const num = d.connectedlinenum || d.calleridnum || d.caller_number || "";
-                const name = d.connectedlinename || d.calleridname || d.caller_name || "";
-                const qid = d.queue;
-
-                if (num) {
-                    callJoinTimes.set(num, Date.now());
-                    
-                    // Добавляем в активный список
-                    if (!activeCallers[qid]) activeCallers[qid] = [];
-                    // Сначала удаляем дубликат, если вдруг есть
-                    removeActiveCaller(qid, num);
-                    activeCallers[qid].push({ number: num, name: name, joinTime: Date.now() });
-                }
+                const num = d.connectedlinenum || d.calleridnum || d.caller_number;
+                if (num) callJoinTimes.set(num, Date.now());
             }
 
             // 2. LEAVE (Answered)
@@ -99,9 +75,6 @@ function connect() {
                 const num = d.caller_number || d.calleridnum;
                 
                 if (qid) {
-                    // Убираем из активных
-                    if (num) removeActiveCaller(qid, num);
-
                     const stats = getQStats(qid);
                     stats.ans++;
                     
@@ -121,17 +94,7 @@ function connect() {
             // 3. ABANDON
             if (type === 'queue_caller_abandon') {
                 const qid = d.queue;
-                const num = d.caller_number || d.calleridnum; // Обычно здесь есть номер
-
                 if (qid) {
-                    // Убираем из активных (ищем по номеру, если он пришел, или удаляем самого старого, если нет)
-                    if (num) {
-                        removeActiveCaller(qid, num);
-                    } else if (activeCallers[qid] && activeCallers[qid].length > 0) {
-                        // Если номера нет, удаляем первого (FIFO) - грубый метод, но лучше чем ничего
-                        activeCallers[qid].shift();
-                    }
-
                     const stats = getQStats(qid);
                     stats.abd++;
                     eventLog.push({ time: Date.now(), type: 'abd', sl: false, queue: qid });
@@ -147,7 +110,7 @@ function connect() {
 
 connect();
 
-// --- API ---
+// API только для статистики (без списка активных)
 app.get('/stats', (req, res) => {
     const now = Date.now();
     const periods = { h1: 3600000, h2: 7200000, h4: 14400000 };
@@ -155,8 +118,7 @@ app.get('/stats', (req, res) => {
     const response = {
         daily: dailyStats,
         globalPeriods: { h1: {}, h2: {}, h4: {} },
-        queuesPeriods: {},
-        activeCallers: activeCallers // <--- ОТДАЕМ СПИСОК ЗВОНЯЩИХ
+        queuesPeriods: {}
     };
 
     const createStat = () => ({ ans: 0, abd: 0, slHits: 0, sl: 0 });
