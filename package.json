@@ -1,0 +1,14 @@
+{
+  "name": "telephony-stats-server",
+  "version": "1.0.0",
+  "description": "Collector for queue stats",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "ws": "^8.13.0",
+    "cors": "^2.8.5"
+  }
+}
