@@ -8,35 +8,52 @@ app.use(cors());
 const PORT = process.env.PORT || 3000;
 const WS_URL = "wss://trackensure.gitstel.net/sw-monitor/?EIO=3&transport=websocket";
 
-// Статистика за день
-let dailyStats = {
-    _date: new Date().toLocaleDateString("en-US"),
-    queues: {}
-};
+// --- ХРАНИЛИЩЕ ИСТОРИИ ---
+// Структура:
+// history = {
+//   "12/30/2025": {
+//      total: { ans: 0, wait: 0 },
+//      hours: {
+//         "14": { ans: 5, wait: 300 },
+//         "15": { ans: 2, wait: 120 }
+//      }
+//   }
+// }
+let history = {};
 
-// Лог для расчета периодов (1h, 2h, 4h)
+// Журнал событий (для расчета периодов 1h/2h/4h в реальном времени)
 let eventLog = [];
 
-// Временная память для SL (номер -> время)
+// Временная память (номер -> время входа)
 const callJoinTimes = new Map();
 
-function checkDateAndReset() {
-    const today = new Date().toLocaleDateString("en-US");
-    if (dailyStats._date !== today) {
-        console.log("New day! Stats reset.");
-        dailyStats = { _date: today, queues: {} };
-        eventLog = [];
-        callJoinTimes.clear();
+// --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+
+function getTodayKey() {
+    return new Date().toLocaleDateString("en-US"); // формат MM/DD/YYYY
+}
+
+function getHourKey() {
+    return new Date().getHours(); // 0..23
+}
+
+// Инициализация дня и часа, если их нет
+function ensureStatsExist(dateKey, hourKey) {
+    if (!history[dateKey]) {
+        history[dateKey] = { total: { ans: 0, wait: 0 }, hours: {} };
+    }
+    if (hourKey !== undefined && !history[dateKey].hours[hourKey]) {
+        history[dateKey].hours[hourKey] = { ans: 0, wait: 0 };
     }
 }
 
-function getQStats(qid) {
-    if (!dailyStats.queues[qid]) {
-        dailyStats.queues[qid] = { ans: 0, abd: 0, sl_hits: 0 };
-    }
-    return dailyStats.queues[qid];
+// Удаляем старые события из журнала (старше 5 часов), чтобы не забивать память
+function cleanEventLog() {
+    const threshold = Date.now() - (5 * 3600 * 1000);
+    eventLog = eventLog.filter(e => e.time > threshold);
 }
 
+// --- WS CLIENT ---
 let ws;
 let pingInterval;
 
@@ -61,8 +78,8 @@ function connect() {
             const type = payload[0];
             const d = payload[1];
 
-            checkDateAndReset();
-
+            const today = getTodayKey();
+            
             // 1. JOIN
             if (type === 'queue_caller_join') {
                 const num = d.connectedlinenum || d.calleridnum || d.caller_number;
@@ -75,29 +92,35 @@ function connect() {
                 const num = d.caller_number || d.calleridnum;
                 
                 if (qid) {
-                    const stats = getQStats(qid);
-                    stats.ans++;
-                    
-                    let isSlHit = false;
+                    let duration = 0;
                     if (num && callJoinTimes.has(num)) {
-                        const duration = (Date.now() - callJoinTimes.get(num)) / 1000;
-                        if (duration <= 30) {
-                            stats.sl_hits++;
-                            isSlHit = true;
-                        }
+                        duration = Math.round((Date.now() - callJoinTimes.get(num)) / 1000);
                         callJoinTimes.delete(num);
                     }
-                    eventLog.push({ time: Date.now(), type: 'ans', sl: isSlHit, queue: qid });
+
+                    // Сохраняем в Realtime лог
+                    eventLog.push({ time: Date.now(), type: 'ans', queue: qid, duration: duration });
+                    cleanEventLog();
+
+                    // Сохраняем в ИСТОРИЮ (по датам и часам)
+                    const hour = getHourKey();
+                    ensureStatsExist(today, hour);
+                    
+                    // Обновляем общий счетчик дня
+                    history[today].total.ans++;
+                    history[today].total.wait += duration;
+
+                    // Обновляем счетчик часа
+                    history[today].hours[hour].ans++;
+                    history[today].hours[hour].wait += duration;
                 }
             }
 
-            // 3. ABANDON
+            // 3. ABANDON (Просто чистим время, в статистику Ans не пишем)
             if (type === 'queue_caller_abandon') {
-                const qid = d.queue;
-                if (qid) {
-                    const stats = getQStats(qid);
-                    stats.abd++;
-                    eventLog.push({ time: Date.now(), type: 'abd', sl: false, queue: qid });
+                const num = d.caller_number || d.calleridnum;
+                if (num && callJoinTimes.has(num)) {
+                    callJoinTimes.delete(num);
                 }
             }
 
@@ -110,50 +133,72 @@ function connect() {
 
 connect();
 
-// API только для статистики (без списка активных)
+// --- API ---
+
+// 1. Основная статистика (Realtime + Periods)
 app.get('/stats', (req, res) => {
     const now = Date.now();
     const periods = { h1: 3600000, h2: 7200000, h4: 14400000 };
     
+    // Берем "сегодняшние" данные из истории для daily totals
+    const todayKey = getTodayKey();
+    ensureStatsExist(todayKey);
+    
+    // Структура ответа
     const response = {
-        daily: dailyStats,
-        globalPeriods: { h1: {}, h2: {}, h4: {} },
-        queuesPeriods: {}
+        // Daily total берем из накопительной истории
+        daily: { 
+            queues: {} // Оставим пустым, так как мы теперь считаем глобально, или можно заполнить если нужно
+        },
+        // А вот это нам важно для Dashboard
+        globalDaily: history[todayKey].total, 
+        
+        globalPeriods: { h1: { ans:0, wait:0 }, h2: { ans:0, wait:0 }, h4: { ans:0, wait:0 } },
+        queuesPeriods: {} 
     };
 
-    const createStat = () => ({ ans: 0, abd: 0, slHits: 0, sl: 0 });
-
-    Object.keys(dailyStats.queues).forEach(qid => {
-        response.queuesPeriods[qid] = { h1: createStat(), h2: createStat(), h4: createStat() };
-    });
-    response.globalPeriods = { h1: createStat(), h2: createStat(), h4: createStat() };
-
+    // Чтобы не ломать старый фронтенд, заполним daily.queues нулями (или можно реализовать логику по очередям в истории, если надо)
+    // Пока упростим: Realtime считаем "на лету" из eventLog
+    
+    // Считаем периоды из eventLog
+    const createStat = () => ({ ans: 0, wait: 0 });
+    
+    // Подготовка объектов очередей
+    // (В реальном eventLog могут быть любые очереди, инициализируем по факту)
+    
     eventLog.forEach(ev => {
+        if (!response.queuesPeriods[ev.queue]) {
+            response.queuesPeriods[ev.queue] = { h1: createStat(), h2: createStat(), h4: createStat() };
+        }
+        
+        // Для таблицы очередей нам нужен Daily Total по каждой очереди. 
+        // В текущей упрощенной history мы храним только глобально. 
+        // Давайте подсчитаем Daily Total для очередей "на лету" из eventLog (только за последние 5 часов).
+        // *Примечание: Это компромисс. Для полной точности надо хранить history[date].queues[qid].*
+        // Но вы просили Total Answered Глобально.
+        
         const diff = now - ev.time;
-        ['h1', 'h2', 'h4'].forEach(pKey => {
-            if (diff <= periods[pKey]) {
-                const gStat = response.globalPeriods[pKey];
-                if (ev.type === 'ans') { gStat.ans++; if (ev.sl) gStat.slHits++; } else { gStat.abd++; }
-
-                if (response.queuesPeriods[ev.queue]) {
-                    const qStat = response.queuesPeriods[ev.queue][pKey];
-                    if (ev.type === 'ans') { qStat.ans++; if (ev.sl) qStat.slHits++; } else { qStat.abd++; }
+        if (ev.type === 'ans') {
+            ['h1', 'h2', 'h4'].forEach(pKey => {
+                if (diff <= periods[pKey]) {
+                    // Global Period
+                    response.globalPeriods[pKey].ans++;
+                    response.globalPeriods[pKey].wait += ev.duration;
+                    
+                    // Queue Period
+                    response.queuesPeriods[ev.queue][pKey].ans++;
+                    response.queuesPeriods[ev.queue][pKey].wait += ev.duration;
                 }
-            }
-        });
-    });
-
-    const calcSL = (obj) => {
-        obj.sl = obj.ans > 0 ? Math.round((obj.slHits / obj.ans) * 100) : 0;
-        delete obj.slHits;
-    };
-
-    ['h1', 'h2', 'h4'].forEach(p => {
-        calcSL(response.globalPeriods[p]);
-        Object.values(response.queuesPeriods).forEach(qObj => calcSL(qObj[p]));
+            });
+        }
     });
 
     res.json(response);
+});
+
+// 2. НОВЫЙ ЭНДПОИНТ: Полная история
+app.get('/history', (req, res) => {
+    res.json(history);
 });
 
 app.listen(PORT, () => console.log(`Server on ${PORT}`));
