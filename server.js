@@ -8,49 +8,35 @@ app.use(cors());
 const PORT = process.env.PORT || 3000;
 const WS_URL = "wss://trackensure.gitstel.net/sw-monitor/?EIO=3&transport=websocket";
 
-// --- ХРАНИЛИЩЕ ---
-// История по дням: { "12/30/2025": { hours: { "10": { ans: 5, wait: 300 } }, total: { ans: 5, wait: 300 } } }
-let history = {}; 
+// Статистика за день
+let dailyStats = {
+    _date: new Date().toLocaleDateString("en-US"),
+    queues: {}
+};
 
-// Лог текущих событий для расчета 1h/2h/4h
-let eventLog = []; 
+// Лог для расчета периодов (1h, 2h, 4h)
+let eventLog = [];
 
-// Память звонков: номер -> время начала (timestamp)
+// Временная память для SL (номер -> время)
 const callJoinTimes = new Map();
 
-// --- HELPERS ---
-function getTodayKey() {
-    return new Date().toLocaleDateString("en-US");
-}
-
-function getHourKey() {
-    return new Date().getHours();
-}
-
-// Безопасное создание структуры истории (чтобы сервер не падал)
-function ensureStatsExist(dateKey, hourKey) {
-    try {
-        if (!history[dateKey]) {
-            history[dateKey] = { total: { ans: 0, wait: 0 }, hours: {} };
-        }
-        if (hourKey !== undefined) {
-            if (!history[dateKey].hours) history[dateKey].hours = {};
-            if (!history[dateKey].hours[hourKey]) {
-                history[dateKey].hours[hourKey] = { ans: 0, wait: 0 };
-            }
-        }
-    } catch (e) {
-        console.error("Init Stats Error:", e);
+function checkDateAndReset() {
+    const today = new Date().toLocaleDateString("en-US");
+    if (dailyStats._date !== today) {
+        console.log("New day! Stats reset.");
+        dailyStats = { _date: today, queues: {} };
+        eventLog = [];
+        callJoinTimes.clear();
     }
 }
 
-// Очистка старых событий из памяти (старше 6 часов)
-function cleanEventLog() {
-    const threshold = Date.now() - (6 * 3600 * 1000);
-    eventLog = eventLog.filter(e => e.time > threshold);
+function getQStats(qid) {
+    if (!dailyStats.queues[qid]) {
+        dailyStats.queues[qid] = { ans: 0, abd: 0, sl_hits: 0 };
+    }
+    return dailyStats.queues[qid];
 }
 
-// --- WEBSOCKET ---
 let ws;
 let pingInterval;
 
@@ -59,7 +45,7 @@ function connect() {
     ws = new WebSocket(WS_URL);
 
     ws.on('open', () => {
-        console.log("Connected to Remote WS!");
+        console.log("Connected!");
         clearInterval(pingInterval);
         pingInterval = setInterval(() => {
             if (ws.readyState === WebSocket.OPEN) ws.send('2');
@@ -75,55 +61,47 @@ function connect() {
             const type = payload[0];
             const d = payload[1];
 
-            // 1. JOIN (Начало звонка)
+            checkDateAndReset();
+
+            // 1. JOIN
             if (type === 'queue_caller_join') {
                 const num = d.connectedlinenum || d.calleridnum || d.caller_number;
                 if (num) callJoinTimes.set(num, Date.now());
             }
 
-            // 2. ANSWERED (Отвеченный)
+            // 2. LEAVE (Answered)
             if (type === 'queue_caller_leave') {
                 const qid = d.queue;
                 const num = d.caller_number || d.calleridnum;
                 
                 if (qid) {
-                    // Считаем сколько висел на линии
-                    let duration = 0;
+                    const stats = getQStats(qid);
+                    stats.ans++;
+                    
+                    let isSlHit = false;
                     if (num && callJoinTimes.has(num)) {
-                        duration = Math.round((Date.now() - callJoinTimes.get(num)) / 1000);
+                        const duration = (Date.now() - callJoinTimes.get(num)) / 1000;
+                        if (duration <= 30) {
+                            stats.sl_hits++;
+                            isSlHit = true;
+                        }
                         callJoinTimes.delete(num);
                     }
-
-                    // 1. Пишем в оперативный лог (для 1h, 2h, 4h)
-                    eventLog.push({ time: Date.now(), type: 'ans', queue: qid, duration: duration });
-                    cleanEventLog();
-
-                    // 2. Пишем в Историю
-                    const today = getTodayKey();
-                    const hour = getHourKey();
-                    ensureStatsExist(today, hour);
-                    
-                    // Обновляем счетчики (с проверкой на существование)
-                    if (history[today] && history[today].total) {
-                        history[today].total.ans++;
-                        history[today].total.wait += duration;
-                    }
-                    if (history[today] && history[today].hours && history[today].hours[hour]) {
-                        history[today].hours[hour].ans++;
-                        history[today].hours[hour].wait += duration;
-                    }
+                    eventLog.push({ time: Date.now(), type: 'ans', sl: isSlHit, queue: qid });
                 }
             }
 
-            // 3. ABANDON (Сброшенный - просто удаляем из памяти времени)
+            // 3. ABANDON
             if (type === 'queue_caller_abandon') {
-                const num = d.caller_number || d.calleridnum;
-                if (num && callJoinTimes.has(num)) callJoinTimes.delete(num);
+                const qid = d.queue;
+                if (qid) {
+                    const stats = getQStats(qid);
+                    stats.abd++;
+                    eventLog.push({ time: Date.now(), type: 'abd', sl: false, queue: qid });
+                }
             }
 
-        } catch (e) { 
-            // Игнорируем ошибки парсинга
-        }
+        } catch (e) { /* ignore */ }
     });
 
     ws.on('close', () => setTimeout(connect, 5000));
@@ -132,67 +110,50 @@ function connect() {
 
 connect();
 
-// --- API ---
-
-// Статистика (Текущая + Периоды)
+// API только для статистики (без списка активных)
 app.get('/stats', (req, res) => {
-    try {
-        const now = Date.now();
-        const periods = { h1: 3600000, h2: 7200000, h4: 14400000 };
-        const todayKey = getTodayKey();
-        
-        // Гарантируем, что объект есть, чтобы фронт не получил null
-        ensureStatsExist(todayKey); 
+    const now = Date.now();
+    const periods = { h1: 3600000, h2: 7200000, h4: 14400000 };
+    
+    const response = {
+        daily: dailyStats,
+        globalPeriods: { h1: {}, h2: {}, h4: {} },
+        queuesPeriods: {}
+    };
 
-        const response = {
-            // Общая статистика за сегодня (из истории)
-            globalDaily: history[todayKey] ? history[todayKey].total : { ans: 0, wait: 0 },
-            // Периоды (считаем сейчас)
-            globalPeriods: { h1: { ans:0, wait:0 }, h2: { ans:0, wait:0 }, h4: { ans:0, wait:0 } },
-            queuesPeriods: {} // По очередям
-        };
+    const createStat = () => ({ ans: 0, abd: 0, slHits: 0, sl: 0 });
 
-        const createStat = () => ({ ans: 0, wait: 0 });
+    Object.keys(dailyStats.queues).forEach(qid => {
+        response.queuesPeriods[qid] = { h1: createStat(), h2: createStat(), h4: createStat() };
+    });
+    response.globalPeriods = { h1: createStat(), h2: createStat(), h4: createStat() };
 
-        // Пробегаем по логу событий
-        eventLog.forEach(ev => {
-            if (!ev.queue) return;
+    eventLog.forEach(ev => {
+        const diff = now - ev.time;
+        ['h1', 'h2', 'h4'].forEach(pKey => {
+            if (diff <= periods[pKey]) {
+                const gStat = response.globalPeriods[pKey];
+                if (ev.type === 'ans') { gStat.ans++; if (ev.sl) gStat.slHits++; } else { gStat.abd++; }
 
-            // Инициализация объекта очереди, если нет
-            if (!response.queuesPeriods[ev.queue]) {
-                response.queuesPeriods[ev.queue] = { h1: createStat(), h2: createStat(), h4: createStat() };
-            }
-            
-            const diff = now - ev.time;
-            
-            // Если это отвеченный звонок
-            if (ev.type === 'ans') {
-                ['h1', 'h2', 'h4'].forEach(pKey => {
-                    if (diff <= periods[pKey]) {
-                        // Глобально
-                        response.globalPeriods[pKey].ans++;
-                        response.globalPeriods[pKey].wait += (ev.duration || 0);
-                        
-                        // По очереди
-                        if (response.queuesPeriods[ev.queue]) {
-                            response.queuesPeriods[ev.queue][pKey].ans++;
-                            response.queuesPeriods[ev.queue][pKey].wait += (ev.duration || 0);
-                        }
-                    }
-                });
+                if (response.queuesPeriods[ev.queue]) {
+                    const qStat = response.queuesPeriods[ev.queue][pKey];
+                    if (ev.type === 'ans') { qStat.ans++; if (ev.sl) qStat.slHits++; } else { qStat.abd++; }
+                }
             }
         });
+    });
 
-        res.json(response);
-    } catch (err) {
-        console.error("API Error:", err);
-        res.status(500).json({ error: "Server Error" });
-    }
-});
+    const calcSL = (obj) => {
+        obj.sl = obj.ans > 0 ? Math.round((obj.slHits / obj.ans) * 100) : 0;
+        delete obj.slHits;
+    };
 
-// История (Для вкладки "Статистика")
-app.get('/history', (req, res) => {
-    res.json(history);
+    ['h1', 'h2', 'h4'].forEach(p => {
+        calcSL(response.globalPeriods[p]);
+        Object.values(response.queuesPeriods).forEach(qObj => calcSL(qObj[p]));
+    });
+
+    res.json(response);
 });
 
 app.listen(PORT, () => console.log(`Server on ${PORT}`));
