@@ -8,44 +8,29 @@ app.use(cors());
 const PORT = process.env.PORT || 3000;
 const WS_URL = "wss://trackensure.gitstel.net/sw-monitor/?EIO=3&transport=websocket";
 
-// Статистика за день
-let dailyStats = {
-    _date: new Date().toLocaleDateString("en-US"),
-    queues: {}
-};
-
-// Журнал подій { time, type, queue, duration }
-let eventLog = [];
-
-// Тимчасова пам'ять (номер -> час входу)
+// ХРАНИЛИЩЕ
+let history = {};
+let eventLog = []; 
 const callJoinTimes = new Map();
 
-function checkDateAndReset() {
-    const today = new Date().toLocaleDateString("en-US");
-    if (dailyStats._date !== today) {
-        console.log("New day! Stats reset.");
-        dailyStats = { _date: today, queues: {} };
-        eventLog = [];
-        callJoinTimes.clear();
+// HELPERS
+function getTodayKey() { return new Date().toLocaleDateString("en-US"); }
+function getHourKey() { return new Date().getHours(); }
+
+function ensureStatsExist(dateKey, hourKey) {
+    if (!history[dateKey]) history[dateKey] = { total: { ans: 0, wait: 0 }, hours: {} };
+    if (hourKey !== undefined) {
+        if (!history[dateKey].hours) history[dateKey].hours = {};
+        if (!history[dateKey].hours[hourKey]) history[dateKey].hours[hourKey] = { ans: 0, wait: 0 };
     }
 }
 
-// Очищення старих логів (старше 5 годин)
-function cleanLogs() {
+function cleanEventLog() {
     const threshold = Date.now() - (5 * 3600 * 1000);
-    if (eventLog.length > 5000) {
-        eventLog = eventLog.filter(e => e.time > threshold);
-    }
+    eventLog = eventLog.filter(e => e.time > threshold);
 }
 
-function getQStats(qid) {
-    if (!dailyStats.queues[qid]) {
-        // ans = прийняті, abd = скинуті (для історії, хоча на фронті не показуємо)
-        dailyStats.queues[qid] = { ans: 0, abd: 0 };
-    }
-    return dailyStats.queues[qid];
-}
-
+// WS CLIENT
 let ws;
 let pingInterval;
 
@@ -69,49 +54,44 @@ function connect() {
             const payload = JSON.parse(str.slice(2));
             const type = payload[0];
             const d = payload[1];
+            const today = getTodayKey();
 
-            checkDateAndReset();
-
-            // 1. JOIN (Запам'ятовуємо час входу)
+            // 1. JOIN
             if (type === 'queue_caller_join') {
                 const num = d.connectedlinenum || d.calleridnum || d.caller_number;
                 if (num) callJoinTimes.set(num, Date.now());
             }
 
-            // 2. LEAVE (Answered - Прийнятий)
+            // 2. ANSWERED
             if (type === 'queue_caller_leave') {
                 const qid = d.queue;
                 const num = d.caller_number || d.calleridnum;
-                
                 if (qid) {
-                    const stats = getQStats(qid);
-                    stats.ans++;
-                    
-                    // Рахуємо тривалість очікування/розмови
                     let duration = 0;
                     if (num && callJoinTimes.has(num)) {
                         duration = Math.round((Date.now() - callJoinTimes.get(num)) / 1000);
                         callJoinTimes.delete(num);
                     }
-                    // Зберігаємо подію з тривалістю
+                    
                     eventLog.push({ time: Date.now(), type: 'ans', queue: qid, duration: duration });
-                    cleanLogs();
+                    cleanEventLog();
+
+                    const hour = getHourKey();
+                    ensureStatsExist(today, hour);
+                    history[today].total.ans++;
+                    history[today].total.wait += duration;
+                    history[today].hours[hour].ans++;
+                    history[today].hours[hour].wait += duration;
                 }
             }
 
-            // 3. ABANDON (Скинутий)
+            // 3. ABANDON
             if (type === 'queue_caller_abandon') {
-                const qid = d.queue;
                 const num = d.caller_number || d.calleridnum;
-                if (qid) {
-                    const stats = getQStats(qid);
-                    stats.abd++;
-                    if (num && callJoinTimes.has(num)) callJoinTimes.delete(num);
-                    // Можемо писати в лог, але для статистики часу це не використовується
-                }
+                if (num && callJoinTimes.has(num)) callJoinTimes.delete(num);
             }
 
-        } catch (e) { /* ignore */ }
+        } catch (e) {}
     });
 
     ws.on('close', () => setTimeout(connect, 5000));
@@ -124,43 +104,34 @@ connect();
 app.get('/stats', (req, res) => {
     const now = Date.now();
     const periods = { h1: 3600000, h2: 7200000, h4: 14400000 };
-    
+    const todayKey = getTodayKey();
+    ensureStatsExist(todayKey);
+
     const response = {
-        daily: dailyStats,
-        globalPeriods: { h1: {}, h2: {}, h4: {} },
+        globalDaily: history[todayKey].total,
+        globalPeriods: { h1: { ans:0, waitSum:0 }, h2: { ans:0, waitSum:0 }, h4: { ans:0, waitSum:0 } },
         queuesPeriods: {}
     };
 
-    // Структура статистики: ans (кількість), wait (сума секунд)
-    const createStat = () => ({ ans: 0, wait: 0 });
-
-    // Ініціалізація глобальних
-    response.globalPeriods = { h1: createStat(), h2: createStat(), h4: createStat() };
+    const createStat = () => ({ ans: 0, waitSum: 0 });
 
     eventLog.forEach(ev => {
-        // Ініціалізація черг по факту
-        if (!response.queuesPeriods[ev.queue]) {
-            response.queuesPeriods[ev.queue] = { h1: createStat(), h2: createStat(), h4: createStat() };
-        }
-
+        if (!response.queuesPeriods[ev.queue]) response.queuesPeriods[ev.queue] = { h1: createStat(), h2: createStat(), h4: createStat() };
         const diff = now - ev.time;
-        // Рахуємо тільки прийняті (ans)
-        if (ev.type === 'ans') { 
+        if (ev.type === 'ans') {
             ['h1', 'h2', 'h4'].forEach(pKey => {
                 if (diff <= periods[pKey]) {
-                    // Global
                     response.globalPeriods[pKey].ans++;
-                    response.globalPeriods[pKey].wait += (ev.duration || 0);
-
-                    // Queue
+                    response.globalPeriods[pKey].waitSum += ev.duration;
                     response.queuesPeriods[ev.queue][pKey].ans++;
-                    response.queuesPeriods[ev.queue][pKey].wait += (ev.duration || 0);
+                    response.queuesPeriods[ev.queue][pKey].waitSum += ev.duration;
                 }
             });
         }
     });
-
     res.json(response);
 });
+
+app.get('/history', (req, res) => res.json(history));
 
 app.listen(PORT, () => console.log(`Server on ${PORT}`));
