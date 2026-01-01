@@ -14,10 +14,10 @@ let dailyStats = {
     queues: {}
 };
 
-// Лог для расчета периодов (1h, 2h, 4h)
+// Журнал подій { time, type, queue, duration }
 let eventLog = [];
 
-// Временная память для SL (номер -> время)
+// Тимчасова пам'ять (номер -> час входу)
 const callJoinTimes = new Map();
 
 function checkDateAndReset() {
@@ -30,9 +30,18 @@ function checkDateAndReset() {
     }
 }
 
+// Очищення старих логів (старше 5 годин)
+function cleanLogs() {
+    const threshold = Date.now() - (5 * 3600 * 1000);
+    if (eventLog.length > 5000) {
+        eventLog = eventLog.filter(e => e.time > threshold);
+    }
+}
+
 function getQStats(qid) {
     if (!dailyStats.queues[qid]) {
-        dailyStats.queues[qid] = { ans: 0, abd: 0, sl_hits: 0 };
+        // ans = прийняті, abd = скинуті (для історії, хоча на фронті не показуємо)
+        dailyStats.queues[qid] = { ans: 0, abd: 0 };
     }
     return dailyStats.queues[qid];
 }
@@ -63,13 +72,13 @@ function connect() {
 
             checkDateAndReset();
 
-            // 1. JOIN
+            // 1. JOIN (Запам'ятовуємо час входу)
             if (type === 'queue_caller_join') {
                 const num = d.connectedlinenum || d.calleridnum || d.caller_number;
                 if (num) callJoinTimes.set(num, Date.now());
             }
 
-            // 2. LEAVE (Answered)
+            // 2. LEAVE (Answered - Прийнятий)
             if (type === 'queue_caller_leave') {
                 const qid = d.queue;
                 const num = d.caller_number || d.calleridnum;
@@ -78,26 +87,27 @@ function connect() {
                     const stats = getQStats(qid);
                     stats.ans++;
                     
-                    let isSlHit = false;
+                    // Рахуємо тривалість очікування/розмови
+                    let duration = 0;
                     if (num && callJoinTimes.has(num)) {
-                        const duration = (Date.now() - callJoinTimes.get(num)) / 1000;
-                        if (duration <= 30) {
-                            stats.sl_hits++;
-                            isSlHit = true;
-                        }
+                        duration = Math.round((Date.now() - callJoinTimes.get(num)) / 1000);
                         callJoinTimes.delete(num);
                     }
-                    eventLog.push({ time: Date.now(), type: 'ans', sl: isSlHit, queue: qid });
+                    // Зберігаємо подію з тривалістю
+                    eventLog.push({ time: Date.now(), type: 'ans', queue: qid, duration: duration });
+                    cleanLogs();
                 }
             }
 
-            // 3. ABANDON
+            // 3. ABANDON (Скинутий)
             if (type === 'queue_caller_abandon') {
                 const qid = d.queue;
+                const num = d.caller_number || d.calleridnum;
                 if (qid) {
                     const stats = getQStats(qid);
                     stats.abd++;
-                    eventLog.push({ time: Date.now(), type: 'abd', sl: false, queue: qid });
+                    if (num && callJoinTimes.has(num)) callJoinTimes.delete(num);
+                    // Можемо писати в лог, але для статистики часу це не використовується
                 }
             }
 
@@ -110,7 +120,7 @@ function connect() {
 
 connect();
 
-// API только для статистики (без списка активных)
+// API
 app.get('/stats', (req, res) => {
     const now = Date.now();
     const periods = { h1: 3600000, h2: 7200000, h4: 14400000 };
@@ -121,36 +131,33 @@ app.get('/stats', (req, res) => {
         queuesPeriods: {}
     };
 
-    const createStat = () => ({ ans: 0, abd: 0, slHits: 0, sl: 0 });
+    // Структура статистики: ans (кількість), wait (сума секунд)
+    const createStat = () => ({ ans: 0, wait: 0 });
 
-    Object.keys(dailyStats.queues).forEach(qid => {
-        response.queuesPeriods[qid] = { h1: createStat(), h2: createStat(), h4: createStat() };
-    });
+    // Ініціалізація глобальних
     response.globalPeriods = { h1: createStat(), h2: createStat(), h4: createStat() };
 
     eventLog.forEach(ev => {
+        // Ініціалізація черг по факту
+        if (!response.queuesPeriods[ev.queue]) {
+            response.queuesPeriods[ev.queue] = { h1: createStat(), h2: createStat(), h4: createStat() };
+        }
+
         const diff = now - ev.time;
-        ['h1', 'h2', 'h4'].forEach(pKey => {
-            if (diff <= periods[pKey]) {
-                const gStat = response.globalPeriods[pKey];
-                if (ev.type === 'ans') { gStat.ans++; if (ev.sl) gStat.slHits++; } else { gStat.abd++; }
+        // Рахуємо тільки прийняті (ans)
+        if (ev.type === 'ans') { 
+            ['h1', 'h2', 'h4'].forEach(pKey => {
+                if (diff <= periods[pKey]) {
+                    // Global
+                    response.globalPeriods[pKey].ans++;
+                    response.globalPeriods[pKey].wait += (ev.duration || 0);
 
-                if (response.queuesPeriods[ev.queue]) {
-                    const qStat = response.queuesPeriods[ev.queue][pKey];
-                    if (ev.type === 'ans') { qStat.ans++; if (ev.sl) qStat.slHits++; } else { qStat.abd++; }
+                    // Queue
+                    response.queuesPeriods[ev.queue][pKey].ans++;
+                    response.queuesPeriods[ev.queue][pKey].wait += (ev.duration || 0);
                 }
-            }
-        });
-    });
-
-    const calcSL = (obj) => {
-        obj.sl = obj.ans > 0 ? Math.round((obj.slHits / obj.ans) * 100) : 0;
-        delete obj.slHits;
-    };
-
-    ['h1', 'h2', 'h4'].forEach(p => {
-        calcSL(response.globalPeriods[p]);
-        Object.values(response.queuesPeriods).forEach(qObj => calcSL(qObj[p]));
+            });
+        }
     });
 
     res.json(response);
