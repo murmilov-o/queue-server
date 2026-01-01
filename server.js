@@ -8,29 +8,35 @@ app.use(cors());
 const PORT = process.env.PORT || 3000;
 const WS_URL = "wss://trackensure.gitstel.net/sw-monitor/?EIO=3&transport=websocket";
 
-// ХРАНИЛИЩЕ
-let history = {};
-let eventLog = []; 
+// Статистика за день
+let dailyStats = {
+    _date: new Date().toLocaleDateString("en-US"),
+    queues: {}
+};
+
+// Лог для расчета периодов (1h, 2h, 4h)
+let eventLog = [];
+
+// Временная память для SL (номер -> время)
 const callJoinTimes = new Map();
 
-// HELPERS
-function getTodayKey() { return new Date().toLocaleDateString("en-US"); }
-function getHourKey() { return new Date().getHours(); }
-
-function ensureStatsExist(dateKey, hourKey) {
-    if (!history[dateKey]) history[dateKey] = { total: { ans: 0, wait: 0 }, hours: {} };
-    if (hourKey !== undefined) {
-        if (!history[dateKey].hours) history[dateKey].hours = {};
-        if (!history[dateKey].hours[hourKey]) history[dateKey].hours[hourKey] = { ans: 0, wait: 0 };
+function checkDateAndReset() {
+    const today = new Date().toLocaleDateString("en-US");
+    if (dailyStats._date !== today) {
+        console.log("New day! Stats reset.");
+        dailyStats = { _date: today, queues: {} };
+        eventLog = [];
+        callJoinTimes.clear();
     }
 }
 
-function cleanEventLog() {
-    const threshold = Date.now() - (5 * 3600 * 1000);
-    eventLog = eventLog.filter(e => e.time > threshold);
+function getQStats(qid) {
+    if (!dailyStats.queues[qid]) {
+        dailyStats.queues[qid] = { ans: 0, abd: 0, sl_hits: 0 };
+    }
+    return dailyStats.queues[qid];
 }
 
-// WS CLIENT
 let ws;
 let pingInterval;
 
@@ -54,7 +60,8 @@ function connect() {
             const payload = JSON.parse(str.slice(2));
             const type = payload[0];
             const d = payload[1];
-            const today = getTodayKey();
+
+            checkDateAndReset();
 
             // 1. JOIN
             if (type === 'queue_caller_join') {
@@ -62,36 +69,39 @@ function connect() {
                 if (num) callJoinTimes.set(num, Date.now());
             }
 
-            // 2. ANSWERED
+            // 2. LEAVE (Answered)
             if (type === 'queue_caller_leave') {
                 const qid = d.queue;
                 const num = d.caller_number || d.calleridnum;
+                
                 if (qid) {
-                    let duration = 0;
+                    const stats = getQStats(qid);
+                    stats.ans++;
+                    
+                    let isSlHit = false;
                     if (num && callJoinTimes.has(num)) {
-                        duration = Math.round((Date.now() - callJoinTimes.get(num)) / 1000);
+                        const duration = (Date.now() - callJoinTimes.get(num)) / 1000;
+                        if (duration <= 30) {
+                            stats.sl_hits++;
+                            isSlHit = true;
+                        }
                         callJoinTimes.delete(num);
                     }
-                    
-                    eventLog.push({ time: Date.now(), type: 'ans', queue: qid, duration: duration });
-                    cleanEventLog();
-
-                    const hour = getHourKey();
-                    ensureStatsExist(today, hour);
-                    history[today].total.ans++;
-                    history[today].total.wait += duration;
-                    history[today].hours[hour].ans++;
-                    history[today].hours[hour].wait += duration;
+                    eventLog.push({ time: Date.now(), type: 'ans', sl: isSlHit, queue: qid });
                 }
             }
 
             // 3. ABANDON
             if (type === 'queue_caller_abandon') {
-                const num = d.caller_number || d.calleridnum;
-                if (num && callJoinTimes.has(num)) callJoinTimes.delete(num);
+                const qid = d.queue;
+                if (qid) {
+                    const stats = getQStats(qid);
+                    stats.abd++;
+                    eventLog.push({ time: Date.now(), type: 'abd', sl: false, queue: qid });
+                }
             }
 
-        } catch (e) {}
+        } catch (e) { /* ignore */ }
     });
 
     ws.on('close', () => setTimeout(connect, 5000));
@@ -100,38 +110,50 @@ function connect() {
 
 connect();
 
-// API
+// API только для статистики (без списка активных)
 app.get('/stats', (req, res) => {
     const now = Date.now();
     const periods = { h1: 3600000, h2: 7200000, h4: 14400000 };
-    const todayKey = getTodayKey();
-    ensureStatsExist(todayKey);
-
+    
     const response = {
-        globalDaily: history[todayKey].total,
-        globalPeriods: { h1: { ans:0, waitSum:0 }, h2: { ans:0, waitSum:0 }, h4: { ans:0, waitSum:0 } },
+        daily: dailyStats,
+        globalPeriods: { h1: {}, h2: {}, h4: {} },
         queuesPeriods: {}
     };
 
-    const createStat = () => ({ ans: 0, waitSum: 0 });
+    const createStat = () => ({ ans: 0, abd: 0, slHits: 0, sl: 0 });
+
+    Object.keys(dailyStats.queues).forEach(qid => {
+        response.queuesPeriods[qid] = { h1: createStat(), h2: createStat(), h4: createStat() };
+    });
+    response.globalPeriods = { h1: createStat(), h2: createStat(), h4: createStat() };
 
     eventLog.forEach(ev => {
-        if (!response.queuesPeriods[ev.queue]) response.queuesPeriods[ev.queue] = { h1: createStat(), h2: createStat(), h4: createStat() };
         const diff = now - ev.time;
-        if (ev.type === 'ans') {
-            ['h1', 'h2', 'h4'].forEach(pKey => {
-                if (diff <= periods[pKey]) {
-                    response.globalPeriods[pKey].ans++;
-                    response.globalPeriods[pKey].waitSum += ev.duration;
-                    response.queuesPeriods[ev.queue][pKey].ans++;
-                    response.queuesPeriods[ev.queue][pKey].waitSum += ev.duration;
+        ['h1', 'h2', 'h4'].forEach(pKey => {
+            if (diff <= periods[pKey]) {
+                const gStat = response.globalPeriods[pKey];
+                if (ev.type === 'ans') { gStat.ans++; if (ev.sl) gStat.slHits++; } else { gStat.abd++; }
+
+                if (response.queuesPeriods[ev.queue]) {
+                    const qStat = response.queuesPeriods[ev.queue][pKey];
+                    if (ev.type === 'ans') { qStat.ans++; if (ev.sl) qStat.slHits++; } else { qStat.abd++; }
                 }
-            });
-        }
+            }
+        });
     });
+
+    const calcSL = (obj) => {
+        obj.sl = obj.ans > 0 ? Math.round((obj.slHits / obj.ans) * 100) : 0;
+        delete obj.slHits;
+    };
+
+    ['h1', 'h2', 'h4'].forEach(p => {
+        calcSL(response.globalPeriods[p]);
+        Object.values(response.queuesPeriods).forEach(qObj => calcSL(qObj[p]));
+    });
+
     res.json(response);
 });
-
-app.get('/history', (req, res) => res.json(history));
 
 app.listen(PORT, () => console.log(`Server on ${PORT}`));
